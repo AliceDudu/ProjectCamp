@@ -1,0 +1,235 @@
+---
+output: html_document
+---
+
+###Load required packages
+```{r, message = FALSE, warning = FALSE}
+library(data.table) #reading in the data
+library(dplyr) #dataframe manipulation
+library(ggplot2) #viz
+library(ranger) #the random forest implementation
+library(plotly) #3D plotting
+library(tidyr) #dataframe manipulation
+library(FNN) #k nearest neighbors algorithm
+library(xgboost)
+```
+
+###Load data, count total #, view columns
+```{r}
+fb <- fread("~/PycharmProjects/kaggle-project/facebook/train.csv", integer64 = "character", showProgress = FALSE)
+nrow(fb)
+```
+
+```{r}
+head(fb, 3)
+```
+
+```{r}
+summary(fb)
+```
+
+
+###Abstract sample area
+```{r}
+fb %>% filter(x >1, x <1.25, y >2.5, y < 2.75) -> fb_s
+nrow(fb_s)  
+```
+
+```{r}
+fb %>% filter(x >3, x <3.25, y >2.5, y < 2.75) -> fb_s2
+nrow(fb_s2)  
+```
+
+##Observe data
+###place_id
+**Since target is to classify place_id, 1st to observe place_id**
+From figures: horizon vs continuously increase
+```{r}
+par(mfrow=c(3,1))
+plot(sort(fb_s$place_id))
+plot(sort(fb_s2$place_id))
+plot(sort(fb_s2$place_id)[0:2000])
+```
+
+From figures: seem no relation between place_id and accuracy
+```{r}
+par(mfrow=c(2,1))
+r_pla_aur=sort(fb_s2$place_id,index.return=TRUE)
+plot(r_pla_aur$x[0:2000])
+d=r_pla_aur$ix[0:2000]
+plot(fb_s2[d,"accuracy"])
+```
+
+```{r}
+par(mfrow=c(2,1))
+r_pla_aur=sort(fb_s2$place_id,index.return=TRUE)
+plot(r_pla_aur$x[500:750])
+d=r_pla_aur$ix[500:750]
+plot(fb_s2[d,"accuracy"])
+```
+
+
+###time
+```{r}
+fb_s$hour = (fb_s$time/60) %% 24
+fb_s$weekday = (fb_s$time/(60*24)) %% 7
+fb_s$month = (fb_s$time/(60*24*30)) %% 12 #month-ish
+fb_s$year = fb_s$time/(60*24*365)
+fb_s$day = fb_s$time/(60*24) %% 365
+head(fb_s)
+```
+
+##Train model
+**Split data**
+```{r}
+small_train = fb_s[fb_s$time < 7.3e5,]
+small_val = fb_s[fb_s$time >= 7.3e5,] 
+```
+
+**visualize 2D: small_train**
+```{r, fig.height = 8, fig.width = 10}
+ggplot(small_train, aes(x, y )) +
+    geom_point(aes(color = place_id)) + 
+    theme_minimal() +
+    theme(legend.position = "none") +
+    ggtitle("Check-ins colored by place_id")
+```
+
+Count by place_id
+```{r}
+sort((small_train %>% count(place_id))$n, decreasing = T)[0:140]
+```
+
+**visualize 3D: small_train with place_id count>500**
+**z=hour**
+```{r, fig.height = 8, fig.width = 8}
+small_train %>% count(place_id) %>% filter(n > 500) -> ids
+  #if n>200, warning: n too large, allowed maximum for palette Set2 is 8
+small_trainz = small_train[small_train$place_id %in% ids$place_id,]
+
+plot_ly(data = small_trainz, x = x , y = y, z = hour, color = place_id,  type = "scatter3d", mode = "markers", marker=list(size= 5)) %>% layout(title = "Place_id's by position and Time of Day")
+```
+
+**z=week**
+```{r}
+plot_ly(data = small_trainz, x = x , y = y, z = weekday, color = place_id,  type = "scatter3d", mode = "markers", marker=list(size= 5)) %>% layout(title = "Place_id's by position and Day of Week")
+
+```
+
+
+##Random Forest
+
+**Count unique place_id**
+```{r}
+length(unique(small_train$place_id))
+```
+
+**Ignore fewer place_id**
+```{r}
+small_train %>% count(place_id) %>% filter(n > 3) -> ids
+small_train = small_train[small_train$place_id %in% ids$place_id,]
+```
+
+#optimal weights for scaling your variables since knn is sensitive to the magnitutde of variables@¥: s,l,w
+```{r}
+summary(small_train)
+```
+
+```{r}
+s = 2
+l = 125
+w = 500
+
+create_matrix = function(train) {
+    cbind(s*train$y,
+          train$x,
+          train$hour/l,
+          train$weekday/w,
+          train$year/w,
+          train$month/w,
+          train$time/(w*60*24*7))
+    }
+
+X = create_matrix(small_train)
+X_val = create_matrix(small_val)
+
+```
+
+**KNN**
+```{r}
+model_knn = FNN::knn(train = X, test = X_val, cl = small_train$place_id, k = 15)
+
+preds <- as.character(model_knn)
+truth <- as.character(small_val$place_id)
+mean(truth == preds)
+```
+
+```{r}
+head(X)
+```
+
+
+**Random Forest**
+```{r}
+set.seed(131L)
+small_train$place_id <- as.factor(small_train$place_id) # ranger needs factors for classification
+model_rf <- ranger(place_id ~ x + y + accuracy + hour + weekday + month + year,
+                   small_train,
+                   num.trees = 100,
+                   write.forest = TRUE,
+                   importance = "impurity")
+
+
+pred = predict(model_rf, small_val)
+pred = pred$predictions
+accuracy = mean(pred == small_val$place_id) 
+
+accuracy
+```
+
+**Visualize RF accuracy**
+It does seem that the correctly identified check-ins are more "clustered" while the wrongly identified ones are more uniformly distributed but other than that no clear patters here.
+```{r}
+small_val$Correct = (pred == small_val$place_id)
+
+ggplot(small_val, aes(x, y )) +
+    geom_point(aes(color = Correct)) + 
+    theme_minimal() +
+    scale_color_brewer(palette = "Set1")
+```
+
+**look at what kind of id's our random forest gets wrong**
+We see below that our model is doing actually really great on the more popular id's(more blue on the right). However it loses when it looks at id's that appear only a few times. 
+```{r, fig.width = 12}
+#reordering the levels based on counts:
+small_val$place_id <- factor(small_val$place_id,
+                             levels = names(sort(table(small_val$place_id), decreasing = TRUE)))
+
+small_val %>% 
+    ggplot(aes(x = place_id)) + geom_bar(aes(fill = Correct)) + 
+    theme_minimal() +
+    theme(axis.text.x = element_blank()) +
+    ggtitle("Prediction Accuracy by ID and Popularity") +
+    scale_fill_brewer(palette = "Set1")
+```
+
+**importance of our variables**
+1. `y` variable is more important than the `x`
+This means that the `y` axis is a better predictior of `place_id` and the random forest figures this out on its own. 
+2. `hour` and other time features are also good predictiors but less so than the spatial features - this makes sense since the location of a check-in should be more important than the time of the check-in.
+3. Accuracy is a bit misterious since we don't get an actual definition for it, but at least the model tells us it's somewhat important.
+```{r}
+data.frame(as.list(model_rf$variable.importance)) %>% gather() %>% 
+    ggplot(aes(x = reorder(key, value), y = value)) +
+    geom_bar(stat = "identity", width = 0.6, fill = "grey") +
+    coord_flip() +
+    theme_minimal() +
+    ggtitle("Variable Importance (Gini Index)") +
+    theme(axis.title.y = element_blank()) 
+
+```
+
+
+
+
+
